@@ -4,15 +4,18 @@ use rocket::serde::json::Json;
 use rocket::Route;
 
 use crate::{
-    api::{core::two_factor::_generate_recover_code, ApiResult, EmptyResult, JsonResult, JsonUpcase, PasswordData},
+    api::{
+        core::log_user_event, core::two_factor::_generate_recover_code, ApiResult, EmptyResult, JsonResult,
+        PasswordOrOtpData,
+    },
     auth::Headers,
     crypto,
     db::{
-        models::{TwoFactor, TwoFactorType, User},
+        models::{EventType, TwoFactor, TwoFactorType, User, UserId},
         DbConn,
     },
     error::MapResult,
-    util::get_reqwest_client,
+    http_client::make_http_request,
     CONFIG,
 };
 
@@ -23,8 +26,8 @@ pub fn routes() -> Vec<Route> {
 #[derive(Serialize, Deserialize)]
 struct DuoData {
     host: String, // Duo API hostname
-    ik: String,   // integration key
-    sk: String,   // secret key
+    ik: String,   // client id
+    sk: String,   // client secret
 }
 
 impl DuoData {
@@ -89,14 +92,13 @@ impl DuoStatus {
 const DISABLED_MESSAGE_DEFAULT: &str = "<To use the global Duo keys, please leave these fields untouched>";
 
 #[post("/two-factor/get-duo", data = "<data>")]
-async fn get_duo(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> JsonResult {
-    let data: PasswordData = data.into_inner().data;
+async fn get_duo(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let data: PasswordOrOtpData = data.into_inner();
+    let user = headers.user;
 
-    if !headers.user.check_valid_password(&data.MasterPasswordHash) {
-        err!("Invalid password");
-    }
+    data.validate(&user, false, &mut conn).await?;
 
-    let data = get_user_duo_data(&headers.user.uuid, &conn).await;
+    let data = get_user_duo_data(&user.uuid, &mut conn).await;
 
     let (enabled, data) = match data {
         DuoStatus::Global(_) => (true, Some(DuoData::secret())),
@@ -107,16 +109,16 @@ async fn get_duo(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn)
 
     let json = if let Some(data) = data {
         json!({
-            "Enabled": enabled,
-            "Host": data.host,
-            "SecretKey": data.sk,
-            "IntegrationKey": data.ik,
-            "Object": "twoFactorDuo"
+            "enabled": enabled,
+            "host": data.host,
+            "clientSecret": data.sk,
+            "clientId": data.ik,
+            "object": "twoFactorDuo"
         })
     } else {
         json!({
-            "Enabled": enabled,
-            "Object": "twoFactorDuo"
+            "enabled": enabled,
+            "object": "twoFactorDuo"
         })
     };
 
@@ -124,20 +126,21 @@ async fn get_duo(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn)
 }
 
 #[derive(Deserialize)]
-#[allow(non_snake_case, dead_code)]
+#[serde(rename_all = "camelCase")]
 struct EnableDuoData {
-    MasterPasswordHash: String,
-    Host: String,
-    SecretKey: String,
-    IntegrationKey: String,
+    host: String,
+    client_secret: String,
+    client_id: String,
+    master_password_hash: Option<String>,
+    otp: Option<String>,
 }
 
 impl From<EnableDuoData> for DuoData {
     fn from(d: EnableDuoData) -> Self {
         Self {
-            host: d.Host,
-            ik: d.IntegrationKey,
-            sk: d.SecretKey,
+            host: d.host,
+            ik: d.client_id,
+            sk: d.client_secret,
         }
     }
 }
@@ -148,17 +151,20 @@ fn check_duo_fields_custom(data: &EnableDuoData) -> bool {
         st.is_empty() || s == DISABLED_MESSAGE_DEFAULT
     }
 
-    !empty_or_default(&data.Host) && !empty_or_default(&data.SecretKey) && !empty_or_default(&data.IntegrationKey)
+    !empty_or_default(&data.host) && !empty_or_default(&data.client_secret) && !empty_or_default(&data.client_id)
 }
 
 #[post("/two-factor/duo", data = "<data>")]
-async fn activate_duo(data: JsonUpcase<EnableDuoData>, headers: Headers, conn: DbConn) -> JsonResult {
-    let data: EnableDuoData = data.into_inner().data;
+async fn activate_duo(data: Json<EnableDuoData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let data: EnableDuoData = data.into_inner();
     let mut user = headers.user;
 
-    if !user.check_valid_password(&data.MasterPasswordHash) {
-        err!("Invalid password");
+    PasswordOrOtpData {
+        master_password_hash: data.master_password_hash.clone(),
+        otp: data.otp.clone(),
     }
+    .validate(&user, true, &mut conn)
+    .await?;
 
     let (data, data_str) = if check_duo_fields_custom(&data) {
         let data_req: DuoData = data.into();
@@ -171,21 +177,23 @@ async fn activate_duo(data: JsonUpcase<EnableDuoData>, headers: Headers, conn: D
 
     let type_ = TwoFactorType::Duo;
     let twofactor = TwoFactor::new(user.uuid.clone(), type_, data_str);
-    twofactor.save(&conn).await?;
+    twofactor.save(&mut conn).await?;
 
-    _generate_recover_code(&mut user, &conn).await;
+    _generate_recover_code(&mut user, &mut conn).await;
+
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &mut conn).await;
 
     Ok(Json(json!({
-        "Enabled": true,
-        "Host": data.host,
-        "SecretKey": data.sk,
-        "IntegrationKey": data.ik,
-        "Object": "twoFactorDuo"
+        "enabled": true,
+        "host": data.host,
+        "clientSecret": data.sk,
+        "clientId": data.ik,
+        "object": "twoFactorDuo"
     })))
 }
 
 #[put("/two-factor/duo", data = "<data>")]
-async fn activate_duo_put(data: JsonUpcase<EnableDuoData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn activate_duo_put(data: Json<EnableDuoData>, headers: Headers, conn: DbConn) -> JsonResult {
     activate_duo(data, headers, conn).await
 }
 
@@ -202,10 +210,7 @@ async fn duo_api_request(method: &str, path: &str, params: &str, data: &DuoData)
 
     let m = Method::from_str(method).unwrap_or_default();
 
-    let client = get_reqwest_client();
-
-    client
-        .request(m, &url)
+    make_http_request(m, &url)?
         .basic_auth(username, Some(password))
         .header(header::USER_AGENT, "vaultwarden:Duo/1.0 (Rust)")
         .header(header::DATE, date)
@@ -223,13 +228,12 @@ const AUTH_PREFIX: &str = "AUTH";
 const DUO_PREFIX: &str = "TX";
 const APP_PREFIX: &str = "APP";
 
-async fn get_user_duo_data(uuid: &str, conn: &DbConn) -> DuoStatus {
+async fn get_user_duo_data(user_id: &UserId, conn: &mut DbConn) -> DuoStatus {
     let type_ = TwoFactorType::Duo as i32;
 
     // If the user doesn't have an entry, disabled
-    let twofactor = match TwoFactor::find_by_user_and_type(uuid, type_, conn).await {
-        Some(t) => t,
-        None => return DuoStatus::Disabled(DuoData::global().is_some()),
+    let Some(twofactor) = TwoFactor::find_by_user_and_type(user_id, type_, conn).await else {
+        return DuoStatus::Disabled(DuoData::global().is_some());
     };
 
     // If the user has the required values, we use those
@@ -247,7 +251,7 @@ async fn get_user_duo_data(uuid: &str, conn: &DbConn) -> DuoStatus {
 }
 
 // let (ik, sk, ak, host) = get_duo_keys();
-async fn get_duo_keys_email(email: &str, conn: &DbConn) -> ApiResult<(String, String, String, String)> {
+pub(crate) async fn get_duo_keys_email(email: &str, conn: &mut DbConn) -> ApiResult<(String, String, String, String)> {
     let data = match User::find_by_mail(email, conn).await {
         Some(u) => get_user_duo_data(&u.uuid, conn).await.data(),
         _ => DuoData::global(),
@@ -257,7 +261,7 @@ async fn get_duo_keys_email(email: &str, conn: &DbConn) -> ApiResult<(String, St
     Ok((data.ik, data.sk, CONFIG.get_duo_akey(), data.host))
 }
 
-pub async fn generate_duo_signature(email: &str, conn: &DbConn) -> ApiResult<(String, String)> {
+pub async fn generate_duo_signature(email: &str, conn: &mut DbConn) -> ApiResult<(String, String)> {
     let now = Utc::now().timestamp();
 
     let (ik, sk, ak, host) = get_duo_keys_email(email, conn).await?;
@@ -265,24 +269,25 @@ pub async fn generate_duo_signature(email: &str, conn: &DbConn) -> ApiResult<(St
     let duo_sign = sign_duo_values(&sk, email, &ik, DUO_PREFIX, now + DUO_EXPIRE);
     let app_sign = sign_duo_values(&ak, email, &ik, APP_PREFIX, now + APP_EXPIRE);
 
-    Ok((format!("{}:{}", duo_sign, app_sign), host))
+    Ok((format!("{duo_sign}:{app_sign}"), host))
 }
 
 fn sign_duo_values(key: &str, email: &str, ikey: &str, prefix: &str, expire: i64) -> String {
-    let val = format!("{}|{}|{}", email, ikey, expire);
+    let val = format!("{email}|{ikey}|{expire}");
     let cookie = format!("{}|{}", prefix, BASE64.encode(val.as_bytes()));
 
     format!("{}|{}", cookie, crypto::hmac_sign(key, &cookie))
 }
 
-pub async fn validate_duo_login(email: &str, response: &str, conn: &DbConn) -> EmptyResult {
-    // email is as entered by the user, so it needs to be normalized before
-    // comparison with auth_user below.
-    let email = &email.to_lowercase();
-
+pub async fn validate_duo_login(email: &str, response: &str, conn: &mut DbConn) -> EmptyResult {
     let split: Vec<&str> = response.split(':').collect();
     if split.len() != 2 {
-        err!("Invalid response length");
+        err!(
+            "Invalid response length",
+            ErrorEvent {
+                event: EventType::UserFailedLogIn2fa
+            }
+        );
     }
 
     let auth_sig = split[0];
@@ -296,7 +301,12 @@ pub async fn validate_duo_login(email: &str, response: &str, conn: &DbConn) -> E
     let app_user = parse_duo_values(&ak, app_sig, &ik, APP_PREFIX, now)?;
 
     if !crypto::ct_eq(&auth_user, app_user) || !crypto::ct_eq(&auth_user, email) {
-        err!("Error validating duo authentication")
+        err!(
+            "Error validating duo authentication",
+            ErrorEvent {
+                event: EventType::UserFailedLogIn2fa
+            }
+        )
     }
 
     Ok(())
@@ -312,7 +322,7 @@ fn parse_duo_values(key: &str, val: &str, ikey: &str, prefix: &str, time: i64) -
     let u_b64 = split[1];
     let u_sig = split[2];
 
-    let sig = crypto::hmac_sign(key, &format!("{}|{}", u_prefix, u_b64));
+    let sig = crypto::hmac_sign(key, &format!("{u_prefix}|{u_b64}"));
 
     if !crypto::ct_eq(crypto::hmac_sign(key, &sig), crypto::hmac_sign(key, u_sig)) {
         err!("Duo signatures don't match")
@@ -322,14 +332,12 @@ fn parse_duo_values(key: &str, val: &str, ikey: &str, prefix: &str, time: i64) -
         err!("Prefixes don't match")
     }
 
-    let cookie_vec = match BASE64.decode(u_b64.as_bytes()) {
-        Ok(c) => c,
-        Err(_) => err!("Invalid Duo cookie encoding"),
+    let Ok(cookie_vec) = BASE64.decode(u_b64.as_bytes()) else {
+        err!("Invalid Duo cookie encoding")
     };
 
-    let cookie = match String::from_utf8(cookie_vec) {
-        Ok(c) => c,
-        Err(_) => err!("Invalid Duo cookie encoding"),
+    let Ok(cookie) = String::from_utf8(cookie_vec) else {
+        err!("Invalid Duo cookie encoding")
     };
 
     let cookie_split: Vec<&str> = cookie.split('|').collect();
