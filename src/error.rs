@@ -1,6 +1,8 @@
 //
 // Error generator macro
 //
+use crate::db::models::EventType;
+use crate::http_client::CustomHttpClientError;
 use std::error::Error as StdError;
 
 macro_rules! make_error {
@@ -8,14 +10,17 @@ macro_rules! make_error {
         const BAD_REQUEST: u16 = 400;
 
         pub enum ErrorKind { $($name( $ty )),+ }
-        pub struct Error { message: String, error: ErrorKind, error_code: u16 }
+
+        #[derive(Debug)]
+        pub struct ErrorEvent { pub event: EventType }
+        pub struct Error { message: String, error: ErrorKind, error_code: u16, event: Option<ErrorEvent> }
 
         $(impl From<$ty> for Error {
             fn from(err: $ty) -> Self { Error::from((stringify!($name), err)) }
         })+
         $(impl<S: Into<String>> From<(S, $ty)> for Error {
             fn from(val: (S, $ty)) -> Self {
-                Error { message: val.0.into(), error: ErrorKind::$name(val.1), error_code: BAD_REQUEST }
+                Error { message: val.0.into(), error: ErrorKind::$name(val.1), error_code: BAD_REQUEST, event: None }
             }
         })+
         impl StdError for Error {
@@ -36,7 +41,6 @@ macro_rules! make_error {
 use diesel::r2d2::PoolError as R2d2Err;
 use diesel::result::Error as DieselErr;
 use diesel::ConnectionError as DieselConErr;
-use diesel_migrations::RunMigrationsError as DieselMigErr;
 use handlebars::RenderError as HbErr;
 use jsonwebtoken::errors::Error as JwtErr;
 use lettre::address::AddressError as AddrErr;
@@ -49,7 +53,6 @@ use rocket::error::Error as RocketErr;
 use serde_json::{Error as SerdeErr, Value};
 use std::io::Error as IoErr;
 use std::time::SystemTimeError as TimeErr;
-use u2f::u2ferror::U2fError as U2fErr;
 use webauthn_rs::error::WebauthnError as WebauthnErr;
 use yubico::yubicoerror::YubicoError as YubiErr;
 
@@ -66,11 +69,14 @@ make_error! {
     Empty(Empty):     _no_source, _serialize,
     // Used to represent err! calls
     Simple(String):  _no_source,  _api_error,
+
+    // Used in our custom http client to handle non-global IPs and blocked domains
+    CustomHttpClient(CustomHttpClientError): _has_source, _api_error,
+
     // Used for special return values, like 2FA errors
     Json(Value):     _no_source,  _serialize,
     Db(DieselErr):   _has_source, _api_error,
     R2d2(R2d2Err):   _has_source, _api_error,
-    U2f(U2fErr):     _has_source, _api_error,
     Serde(SerdeErr): _has_source, _api_error,
     JWt(JwtErr):     _has_source, _api_error,
     Handlebars(HbErr): _has_source, _api_error,
@@ -88,7 +94,6 @@ make_error! {
     Rocket(RocketErr): _has_source, _api_error,
 
     DieselCon(DieselConErr): _has_source, _api_error,
-    DieselMig(DieselMigErr): _has_source, _api_error,
     Webauthn(WebauthnErr):   _has_source, _api_error,
 }
 
@@ -132,6 +137,16 @@ impl Error {
         self.error_code = code;
         self
     }
+
+    #[must_use]
+    pub fn with_event(mut self, event: ErrorEvent) -> Self {
+        self.event = Some(event);
+        self
+    }
+
+    pub fn get_event(&self) -> &Option<ErrorEvent> {
+        &self.event
+    }
 }
 
 pub trait MapResult<S> {
@@ -156,7 +171,6 @@ impl<S> MapResult<S> for Option<S> {
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
 const fn _has_source<T>(e: T) -> Option<T> {
     Some(e)
 }
@@ -170,18 +184,18 @@ fn _serialize(e: &impl serde::Serialize, _msg: &str) -> String {
 
 fn _api_error(_: &impl std::any::Any, msg: &str) -> String {
     let json = json!({
-        "Message": msg,
+        "message": msg,
         "error": "",
         "error_description": "",
-        "ValidationErrors": {"": [ msg ]},
-        "ErrorModel": {
-            "Message": msg,
-            "Object": "error"
+        "validationErrors": {"": [ msg ]},
+        "errorModel": {
+            "message": msg,
+            "object": "error"
         },
-        "ExceptionMessage": null,
-        "ExceptionStackTrace": null,
-        "InnerExceptionMessage": null,
-        "Object": "error"
+        "exceptionMessage": null,
+        "exceptionStackTrace": null,
+        "innerExceptionMessage": null,
+        "object": "error"
     });
     _serialize(&json, "")
 }
@@ -195,7 +209,7 @@ use rocket::http::{ContentType, Status};
 use rocket::request::Request;
 use rocket::response::{self, Responder, Response};
 
-impl<'r> Responder<'r, 'static> for Error {
+impl Responder<'_, 'static> for Error {
     fn respond_to(self, _: &Request<'_>) -> response::Result<'static> {
         match self.error {
             ErrorKind::Empty(_) => {}  // Don't print the error in this situation
@@ -216,32 +230,41 @@ impl<'r> Responder<'r, 'static> for Error {
 macro_rules! err {
     ($msg:expr) => {{
         error!("{}", $msg);
-        return Err(crate::error::Error::new($msg, $msg));
+        return Err($crate::error::Error::new($msg, $msg));
+    }};
+    ($msg:expr, ErrorEvent $err_event:tt) => {{
+        error!("{}", $msg);
+        return Err($crate::error::Error::new($msg, $msg).with_event($crate::error::ErrorEvent $err_event));
     }};
     ($usr_msg:expr, $log_value:expr) => {{
         error!("{}. {}", $usr_msg, $log_value);
-        return Err(crate::error::Error::new($usr_msg, $log_value));
+        return Err($crate::error::Error::new($usr_msg, $log_value));
+    }};
+    ($usr_msg:expr, $log_value:expr, ErrorEvent $err_event:tt) => {{
+        error!("{}. {}", $usr_msg, $log_value);
+        return Err($crate::error::Error::new($usr_msg, $log_value).with_event($crate::error::ErrorEvent $err_event));
     }};
 }
 
+#[macro_export]
 macro_rules! err_silent {
     ($msg:expr) => {{
-        return Err(crate::error::Error::new($msg, $msg));
+        return Err($crate::error::Error::new($msg, $msg));
     }};
     ($usr_msg:expr, $log_value:expr) => {{
-        return Err(crate::error::Error::new($usr_msg, $log_value));
+        return Err($crate::error::Error::new($usr_msg, $log_value));
     }};
 }
 
 #[macro_export]
 macro_rules! err_code {
-    ($msg:expr, $err_code: expr) => {{
+    ($msg:expr, $err_code:expr) => {{
         error!("{}", $msg);
-        return Err(crate::error::Error::new($msg, $msg).with_code($err_code));
+        return Err($crate::error::Error::new($msg, $msg).with_code($err_code));
     }};
-    ($usr_msg:expr, $log_value:expr, $err_code: expr) => {{
+    ($usr_msg:expr, $log_value:expr, $err_code:expr) => {{
         error!("{}. {}", $usr_msg, $log_value);
-        return Err(crate::error::Error::new($usr_msg, $log_value).with_code($err_code));
+        return Err($crate::error::Error::new($usr_msg, $log_value).with_code($err_code));
     }};
 }
 
@@ -249,11 +272,11 @@ macro_rules! err_code {
 macro_rules! err_discard {
     ($msg:expr, $data:expr) => {{
         std::io::copy(&mut $data.open(), &mut std::io::sink()).ok();
-        return Err(crate::error::Error::new($msg, $msg));
+        return Err($crate::error::Error::new($msg, $msg));
     }};
     ($usr_msg:expr, $log_value:expr, $data:expr) => {{
         std::io::copy(&mut $data.open(), &mut std::io::sink()).ok();
-        return Err(crate::error::Error::new($usr_msg, $log_value));
+        return Err($crate::error::Error::new($usr_msg, $log_value));
     }};
 }
 
@@ -262,16 +285,19 @@ macro_rules! err_json {
     ($expr:expr, $log_value:expr) => {{
         return Err(($log_value, $expr).into());
     }};
+    ($expr:expr, $log_value:expr, $err_event:expr, ErrorEvent) => {{
+        return Err(($log_value, $expr).into().with_event($err_event));
+    }};
 }
 
 #[macro_export]
 macro_rules! err_handler {
     ($expr:expr) => {{
         error!(target: "auth", "Unauthorized Error: {}", $expr);
-        return ::rocket::request::Outcome::Failure((rocket::http::Status::Unauthorized, $expr));
+        return ::rocket::request::Outcome::Error((rocket::http::Status::Unauthorized, $expr));
     }};
     ($usr_msg:expr, $log_value:expr) => {{
         error!(target: "auth", "Unauthorized Error: {}. {}", $usr_msg, $log_value);
-        return ::rocket::request::Outcome::Failure((rocket::http::Status::Unauthorized, $usr_msg));
+        return ::rocket::request::Outcome::Error((rocket::http::Status::Unauthorized, $usr_msg));
     }};
 }
